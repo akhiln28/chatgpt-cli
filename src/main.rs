@@ -1,9 +1,11 @@
 use dirs;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, AUTHORIZATION, CONTENT_TYPE};
-use rustix::process;
+// use rustix::process;
+use chrono;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
+use std::path::PathBuf;
 use std::{
     env,
     fs::{self},
@@ -30,6 +32,26 @@ struct OpenAIRequest {
     messages: Vec<Message>,
 }
 
+fn get_latest_file(folder_path: &PathBuf) -> PathBuf {
+    let mut latest_file: PathBuf = PathBuf::new();
+    let mut latest_file_time: u64 = 0;
+    for entry in fs::read_dir(folder_path).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let metadata = fs::metadata(&path).unwrap();
+        let modified = metadata.modified().unwrap();
+        let modified_time = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if modified_time > latest_file_time {
+            latest_file_time = modified_time;
+            latest_file = path;
+        }
+    }
+    latest_file
+}
+
 fn main() -> Result<(), Error> {
     // get OPENAI_API_KEY from environment variable
     let key = "OPENAI_API_KEY";
@@ -38,65 +60,29 @@ fn main() -> Result<(), Error> {
     // get the prompt from the user
     let args: Vec<String> = env::args().skip(1).collect();
     let prompt = args.join(" ");
-
-    // load the chatlog for this terminal window
-    let chatlog_path = dirs::home_dir()
-        .expect("Failed to get home directory")
-        .join(".chatgpt")
-        .join(
-            process::getppid()
-                .expect("Failed to get parent process id")
-                .as_raw_nonzero()
-                .to_string(),
-        )
-        .join("chatlog.json");
-
-    fs::create_dir_all(chatlog_path.parent().unwrap())?;
-
-    let mut file = OpenOptions::new()
-        .create(true) // create the file if it doesn't exist
-        .append(true) // don't overwrite the contents
-        .read(true)
-        .open(&chatlog_path)
-        .unwrap();
-
-    let mut chatlog_text = String::new();
-    file.read_to_string(&mut chatlog_text)?;
-
-    // get the messages from the chatlog. limit the total number of tokens to 3000
-    const MAX_TOKENS: i64 = 2000;
-    let mut total_tokens: i64 = 0;
-    let mut messages: Vec<Message> = vec![];
-    let mut chatlog: Vec<Log> = vec![];
-
-    if !chatlog_text.is_empty() {
-        chatlog = serde_json::from_str(&chatlog_text)?;
-        for log in chatlog.iter().rev() {
-            if total_tokens + log.tokens > MAX_TOKENS {
-                continue;
-            }
-
-            total_tokens += log.tokens;
-            messages.push(Message {
-                role: log.role.clone(),
-                content: log.content.clone(),
-            });
-        }
+    if args[0] == "reset" {
+        let current_timestamp_in_seconds = chrono::Utc::now().timestamp();
+        // create a new chatlog file with the current timestamp
+        let chatgpt_folder: PathBuf = dirs::home_dir()
+            .expect("Failed to get home directory")
+            .join(".chatgpt");
+        let chatlog_path = chatgpt_folder.join(format!("{}.json", current_timestamp_in_seconds));
+        fs::File::create(chatlog_path)?;
+        println!(
+            "Created new chatlog file: {}.json",
+            current_timestamp_in_seconds
+        );
+        return Ok(());
     }
 
-    messages = messages.into_iter().rev().collect();
+    let folder_path: PathBuf = dirs::home_dir()
+        .expect("Failed to get home directory")
+        .join(".chatgpt");
 
-    messages.push(Message {
-        role: "user".to_string(),
-        content: prompt.clone(),
-    });
+    let chatlog_path = get_latest_file(&folder_path);
 
-    // send the POST request to OpenAI
+    let (mut chatlog, data) = create_request(&chatlog_path, &prompt)?;
     let client = Client::new();
-    let data = OpenAIRequest {
-        model: "gpt-3.5-turbo".to_string(),
-        messages,
-    };
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -104,7 +90,10 @@ fn main() -> Result<(), Error> {
         format!("Bearer {}", openai_api_key).parse().unwrap(),
     );
     headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
     let json_data = serde_json::to_string(&data)?;
+
+    let start_time_seconds = chrono::Utc::now().timestamp();
     let response = client
         .post("https://api.openai.com/v1/chat/completions".to_string())
         .headers(headers)
@@ -151,5 +140,51 @@ fn main() -> Result<(), Error> {
     let chatlog_text = serde_json::to_string(&chatlog)?;
     fs::write(&chatlog_path, chatlog_text)?;
 
+    let end_time_seconds = chrono::Utc::now().timestamp();
+    let elapsed_time_seconds = end_time_seconds - start_time_seconds;
+    println!("Elapsed time: {} seconds", elapsed_time_seconds.to_string());
     Ok(())
+}
+
+fn create_request(
+    chatlog_path: &PathBuf,
+    prompt: &String,
+) -> Result<(Vec<Log>, OpenAIRequest), Error> {
+    let mut file = OpenOptions::new()
+        .create(true) // create the file if it doesn't exist
+        .append(true) // don't overwrite the contents
+        .read(true)
+        .open(chatlog_path)
+        .unwrap();
+    let mut chatlog_text = String::new();
+    file.read_to_string(&mut chatlog_text)?;
+    const MAX_TOKENS: i64 = 2000;
+    let mut total_tokens: i64 = 0;
+    let mut messages: Vec<Message> = vec![];
+    let mut chatlog: Vec<Log> = vec![];
+    if !chatlog_text.is_empty() {
+        chatlog = serde_json::from_str(&chatlog_text)?;
+        for log in chatlog.iter().rev() {
+            if total_tokens + log.tokens > MAX_TOKENS {
+                println!("Trunkating chatlog to {} tokens", MAX_TOKENS);
+                break;
+            }
+
+            total_tokens += log.tokens;
+            messages.push(Message {
+                role: log.role.clone(),
+                content: log.content.clone(),
+            });
+        }
+    }
+    messages = messages.into_iter().rev().collect();
+    messages.push(Message {
+        role: "user".to_string(),
+        content: prompt.clone(),
+    });
+    let data = OpenAIRequest {
+        model: "gpt-3.5-turbo".to_string(),
+        messages,
+    };
+    Ok((chatlog, data))
 }
