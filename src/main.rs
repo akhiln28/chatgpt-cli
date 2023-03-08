@@ -79,7 +79,20 @@ fn main() -> Result<(), Error> {
         .expect("Failed to get home directory")
         .join(".chatgpt");
 
+    // create the folder if it doesn't exist
+    fs::create_dir_all(&folder_path)?;
+
     let chatlog_path = get_latest_file(&folder_path);
+
+    // if chatlog_path is empty, create a new chatlog file
+    let file_name = chrono::Utc::now().timestamp().to_string();
+    let chatlog_path = if chatlog_path.to_str().unwrap() == "" {
+        let chatlog_path = folder_path.join(format!("{}.json", file_name));
+        fs::File::create(chatlog_path.clone())?;
+        chatlog_path
+    } else {
+        chatlog_path
+    };
 
     let (mut chatlog, data) = create_request(&chatlog_path, &prompt)?;
     let client = Client::new();
