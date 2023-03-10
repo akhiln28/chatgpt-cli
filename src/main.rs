@@ -30,6 +30,7 @@ struct OpenAIRequest {
     model: String,
     #[serde(rename = "messages")]
     messages: Vec<Message>,
+    stream: bool,
 }
 
 fn get_latest_file(folder_path: &PathBuf) -> PathBuf {
@@ -185,6 +186,7 @@ fn create_request(
     let data = OpenAIRequest {
         model: "gpt-3.5-turbo".to_string(),
         messages,
+        stream: true
     };
     Ok((chatlog, data))
 }
